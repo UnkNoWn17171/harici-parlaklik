@@ -2,6 +2,7 @@
 // Monitörler `ddcutil detect` ile bulunur (DDC/CI destekleyen her monitör, hangi port olursa olsun).
 // Monitör takılıp çıkarılınca liste yeniden kurulur; menü her açıldığında değer monitörden okunur
 // (monitörün kendi tuşlarıyla yapılan değişiklikler de yansısın diye).
+// Yazılan değer geri okunarak doğrulanır; monitör komutu yok sayarsa bildirim gösterilir.
 
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
@@ -13,6 +14,7 @@ import {QuickSlider, SystemIndicator} from 'resource:///org/gnome/shell/ui/quick
 
 const SET_DELAY_MS = 120;     // kaydırıcı sürüklenirken komut yağmurunu önleme
 const REDETECT_DELAY_MS = 2500; // monitör takıldıktan sonra DDC'nin hazır olması için bekleme
+const VERIFY_DELAY_MS = 800;     // yazdıktan sonra monitörün uygulayıp uygulamadığını okuma gecikmesi
 
 function run(argv) {
     return new Promise((resolve, reject) => {
@@ -51,30 +53,53 @@ function parseDetect(out) {
 const DdcSlider = GObject.registerClass(
 class DdcSlider extends QuickSlider {
     _init(display) {
-        super._init({iconName: 'video-display-symbolic'});
+        super._init({iconName: 'video-display-symbolic', menuEnabled: true});
         this._bus = display.bus;
+        this._name = display.name;
         this._max = 100;
         this._busy = false;
         this._pending = null;
         this._timeoutId = 0;
+        this._verifyId = 0;
+        this._rejected = false;   // monitör yazma komutlarını yok sayıyor mu
+        this._notified = false;
         this.slider.accessible_name = `${display.name} parlaklığı`;
+
+        // ok düğmesiyle açılan menü: monitör adı + durum
+        this.menu.addAction('Değeri monitörden yeniden oku', () => this.refresh());
+        this._updateHeader();
 
         this._changedId = this.slider.connect('notify::value', () => this._queueSet());
         this.refresh();
     }
 
+    _updateHeader() {
+        const status = this._rejected
+            ? 'Monitör parlaklık değişikliğini reddediyor (README → Sorun giderme)'
+            : `DDC/CI · i2c-${this._bus}`;
+        this.menu.setHeader('video-display-symbolic', this._name, status);
+    }
+
+    _setSlider(cur) {
+        this.slider.block_signal_handler(this._changedId);
+        this.slider.value = cur / this._max;
+        this.slider.unblock_signal_handler(this._changedId);
+    }
+
+    async _read() {
+        const out = await run(['ddcutil', 'getvcp', '10', '--bus', this._bus, '--brief']);
+        const m = out.match(/VCP 10 C (\d+) (\d+)/);
+        if (!m)
+            throw new Error(`beklenmeyen çıktı: ${out.trim()}`);
+        this._max = Number(m[2]) || 100;
+        return Number(m[1]);
+    }
+
     async refresh() {
-        if (this._busy || this._timeoutId || this.slider._dragging)
+        if (this._busy || this._timeoutId || this._verifyId || this.slider._dragging)
             return;
         try {
-            const out = await run(['ddcutil', 'getvcp', '10', '--bus', this._bus, '--brief']);
-            const m = out.match(/VCP 10 C (\d+) (\d+)/);
-            if (!m)
-                return;
-            this._max = Number(m[2]) || 100;
-            this.slider.block_signal_handler(this._changedId);
-            this.slider.value = Number(m[1]) / this._max;
-            this.slider.unblock_signal_handler(this._changedId);
+            this._setSlider(await this._read());
         } catch (e) {
             console.warn(`[harici-parlaklik] okuma hatası (i2c-${this._bus}): ${e.message}`);
         }
@@ -104,14 +129,57 @@ class DdcSlider extends QuickSlider {
             console.warn(`[harici-parlaklik] yazma hatası (i2c-${this._bus}): ${e.message}`);
         }
         this._busy = false;
-        this._flush();
+        if (this._pending !== null)
+            this._flush();
+        else
+            this._scheduleVerify(value);
+    }
+
+    // Bazı monitörler (ör. MSI'da Pro Mode "User" değilken) komutu kabul edip uygulamaz;
+    // son yazılan değeri geri okuyup karşılaştır, uygulanmadıysa kullanıcıya bildir.
+    _scheduleVerify(value) {
+        if (this._verifyId)
+            GLib.source_remove(this._verifyId);
+        this._verifyId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, VERIFY_DELAY_MS, () => {
+            this._verifyId = 0;
+            this._verify(value);
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    async _verify(value) {
+        if (this._busy || this._timeoutId || this._pending !== null)
+            return; // kullanıcı hâlâ değiştiriyor, sonraki yazmadan sonra bakılır
+        let cur;
+        try {
+            cur = await this._read();
+        } catch (e) {
+            console.warn(`[harici-parlaklik] doğrulama okuma hatası (i2c-${this._bus}): ${e.message}`);
+            return;
+        }
+        const rejected = Math.abs(cur - value) > 1;
+        if (rejected !== this._rejected) {
+            this._rejected = rejected;
+            this._updateHeader();
+        }
+        if (!rejected)
+            return;
+        this._setSlider(cur); // kaydırıcı gerçek değeri göstersin
+        console.warn(`[harici-parlaklik] ${this._name}: ${value} yazıldı, monitör ${cur} bildiriyor`);
+        if (!this._notified) {
+            this._notified = true;
+            Main.notify(`${this._name}: parlaklık değiştirilemiyor`,
+                'Monitör DDC/CI komutunu kabul etti ama uygulamadı. Monitör menüsünden ' +
+                'renk/görüntü modunu "Kullanıcı (User)" yapın ve DDC/CI açık olsun.');
+        }
     }
 
     destroy() {
-        if (this._timeoutId) {
-            GLib.source_remove(this._timeoutId);
-            this._timeoutId = 0;
+        for (const id of [this._timeoutId, this._verifyId]) {
+            if (id)
+                GLib.source_remove(id);
         }
+        this._timeoutId = this._verifyId = 0;
         super.destroy();
     }
 });

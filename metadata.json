@@ -3,5 +3,5 @@
   "name": "Harici Monitor Parlakligi",
   "description": "Hizli ayarlar menusune DDC/CI (ddcutil) ile harici monitor parlaklik kaydiricisi ekler. Takilan her monitor otomatik algilanir.",
   "shell-version": ["46"],
-  "version": 1
+  "version": 2
 }
